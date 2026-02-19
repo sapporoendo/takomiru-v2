@@ -100,12 +100,20 @@ PDF各ページを 300dpi相当以上で画像化
 
 ### 6-3. 中心点推定（最重要）
 優先順位：
-中央穴（暗い円）検出→中心
+円盤外周（outer circle）を検出→中心（outer-first）
+補助：中央穴（spindle、暗い円）検出→中心（任意）
 だめなら同心円検出→同心性最大の中心
 不確実：中心候補差が大きい → qc_flags.center_uncertain
 
 ### 6-4. 速度帯（speed band）の確定
-同心円罫線が密な帯をエッジ密度で推定し、r_in, r_out を決める
+速度帯（0–120km/hリング）は、円盤外周半径 outer_radius を基準に固定の円環ROIとして切り出す。
+
+- R = outer_radius
+- r_in = 0.55 * R
+- r_out = 0.86 * R
+
+ROI外は強制的にマスク（ピクセル=0）し、以降の針抽出はROI内限定で行う。
+outer_radius が不確実/未推定の場合：qc_flags.speed_band_uncertain
 不確実：qc_flags.speed_band_uncertain
 
 ### 6-5. 角度サンプリング
