@@ -6,7 +6,7 @@ from pathlib import Path
 
 import cv2
 
-from .center import estimate_center
+from .center import estimate_center_auto
 from .io import load_image, rgb_to_gray_u8
 
 
@@ -21,7 +21,7 @@ def main() -> int:
 
     loaded = load_image(args.input, pdf_page_index=args.pdf_page, pdf_dpi=args.pdf_dpi)
     gray = rgb_to_gray_u8(loaded.rgb)
-    est = estimate_center(gray)
+    est = estimate_center_auto(gray)
 
     out = {
         "source": str(Path(loaded.source_path)),
