@@ -17,6 +17,31 @@ class CenterEstimation:
     debug: Dict[str, object]
 
 
+def _remove_border_touching_components(mask_u8: np.ndarray) -> np.ndarray:
+    h, w = mask_u8.shape[:2]
+    if h <= 0 or w <= 0:
+        return mask_u8
+
+    m = (mask_u8 > 0).astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if n <= 1:
+        return mask_u8
+
+    keep = np.zeros((h, w), dtype=np.uint8)
+    for lab in range(1, int(n)):
+        x, y, ww, hh, area = stats[lab]
+        if area <= 0:
+            continue
+        touches = (x <= 0) or (y <= 0) or ((x + ww) >= w) or ((y + hh) >= h)
+        if touches:
+            continue
+        keep[labels == lab] = 255
+
+    if int(np.count_nonzero(keep)) == 0:
+        return mask_u8
+    return keep
+
+
 def _disc_circle_contour(gray_u8: np.ndarray) -> Optional[Tuple[float, float, float, float]]:
     h, w = gray_u8.shape[:2]
     min_dim = min(h, w)
@@ -25,8 +50,26 @@ def _disc_circle_contour(gray_u8: np.ndarray) -> Optional[Tuple[float, float, fl
     if float(np.mean(mask)) < 127.0:
         mask = 255 - mask
 
+    mask_area_ratio = float(np.count_nonzero(mask)) / float(max(1, h * w))
+    if mask_area_ratio > 0.60 or mask_area_ratio < 0.05:
+        # Otsu sometimes collapses to almost full-frame on these scans.
+        # Fall back to a percentile threshold assuming the disc is brighter than background.
+        # Choose a percentile that yields a reasonable area ratio.
+        mask = None
+        for p in (80.0, 85.0, 90.0, 92.0, 94.0, 96.0):
+            thr = float(np.percentile(blur, p))
+            m = (blur >= thr).astype(np.uint8) * 255
+            ar = float(np.count_nonzero(m)) / float(max(1, h * w))
+            if 0.06 <= ar <= 0.35:
+                mask = m
+                break
+        if mask is None:
+            thr = float(np.percentile(blur, 92.0))
+            mask = (blur >= thr).astype(np.uint8) * 255
+
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = _remove_border_touching_components(mask)
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
@@ -78,8 +121,25 @@ def _disc_roi(gray_u8: np.ndarray, *, margin_ratio: float = 0.08) -> Optional[Tu
     if float(np.mean(mask)) < 127.0:
         mask = 255 - mask
 
+    mask_area_ratio = float(np.count_nonzero(mask)) / float(max(1, h * w))
+    if mask_area_ratio > 0.60 or mask_area_ratio < 0.05:
+        # Otsu sometimes collapses to almost full-frame on these scans.
+        # Fall back to a percentile threshold assuming the disc is brighter than background.
+        mask = None
+        for p in (80.0, 85.0, 90.0, 92.0, 94.0, 96.0):
+            thr = float(np.percentile(blur, p))
+            m = (blur >= thr).astype(np.uint8) * 255
+            ar = float(np.count_nonzero(m)) / float(max(1, h * w))
+            if 0.06 <= ar <= 0.35:
+                mask = m
+                break
+        if mask is None:
+            thr = float(np.percentile(blur, 92.0))
+            mask = (blur >= thr).astype(np.uint8) * 255
+
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = _remove_border_touching_components(mask)
 
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
@@ -90,7 +150,7 @@ def _disc_roi(gray_u8: np.ndarray, *, margin_ratio: float = 0.08) -> Optional[Tu
     if area < (h * w) * 0.02:
         return None
 
-    # If the mask became almost full-frame, contour ROI is not useful.
+    # If the mask became almost full-frame even after fallback, contour ROI is not useful.
     if area > (h * w) * 0.90:
         return None
 
@@ -142,7 +202,13 @@ def _disc_roi_hough(gray_u8: np.ndarray, *, margin_ratio: float = 0.08) -> Optio
     for i in range(max_check):
         cx, cy, r = circles[i]
         edge = _circle_edge_score(gray_u8, x=float(cx), y=float(cy), r=float(r))
-        score = float(edge) + (float(r) * 0.03)
+        # Prefer circles near the image center; avoids picking partial/false circles far away.
+        dx = float(cx) - float(w) / 2.0
+        dy = float(cy) - float(h) / 2.0
+        dist = float(np.hypot(dx, dy))
+        # Strongly prefer larger radii (disc outer boundary) and centrality.
+        # Edge score is only a small tie-breaker because it can be high on non-disc structures.
+        score = (float(r) * 1.0) - (dist * 0.6) + (float(edge) * 0.02)
         if score > best_score:
             best_score = score
             best = (float(cx), float(cy), float(r))
@@ -692,25 +758,27 @@ def estimate_center_auto(gray_u8: np.ndarray) -> CenterEstimation:
 
     roi_method = None
     roi_res = None
-    if spindle is not None:
-        cx, cy = float(spindle[0]), float(spindle[1])
-        outer_max_r = int(min_dim * 0.60)
-        half = float(outer_max_r) * 1.15
-        x0 = int(max(0, np.floor(cx - half)))
-        y0 = int(max(0, np.floor(cy - half)))
-        x1 = int(min(w, np.ceil(cx + half)))
-        y1 = int(min(h, np.ceil(cy + half)))
-        if (x1 - x0) >= 10 and (y1 - y0) >= 10:
-            roi = gray_u8[y0:y1, x0:x1]
-            roi_res = (roi, (x0, y0))
-            roi_method = "spindle"
-
-    if roi_res is None:
-        roi_res = _disc_roi(gray_u8)
-        roi_method = "contour" if roi_res is not None else roi_method
+    # Prefer disc contour ROI; spindle detection can be a false positive on some scans and
+    # can cause ROI to be cut far away from the actual disc.
+    roi_res = _disc_roi(gray_u8)
+    roi_method = "contour" if roi_res is not None else roi_method
     if roi_res is None:
         roi_res = _disc_roi_hough(gray_u8)
         roi_method = "hough" if roi_res is not None else roi_method
+    if roi_res is None and spindle is not None:
+        cx, cy = float(spindle[0]), float(spindle[1])
+        # Sanity-check spindle position; ignore if too close to borders.
+        if (0.15 * w) <= cx <= (0.85 * w) and (0.15 * h) <= cy <= (0.85 * h):
+            outer_max_r = int(min_dim * 0.60)
+            half = float(outer_max_r) * 1.15
+            x0 = int(max(0, np.floor(cx - half)))
+            y0 = int(max(0, np.floor(cy - half)))
+            x1 = int(min(w, np.ceil(cx + half)))
+            y1 = int(min(h, np.ceil(cy + half)))
+            if (x1 - x0) >= 10 and (y1 - y0) >= 10:
+                roi = gray_u8[y0:y1, x0:x1]
+                roi_res = (roi, (x0, y0))
+                roi_method = "spindle"
     if roi_res is None:
         est = estimate_center(gray_u8)
         return CenterEstimation(

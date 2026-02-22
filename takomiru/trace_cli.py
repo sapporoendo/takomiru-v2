@@ -10,7 +10,13 @@ import numpy as np
 from .center import estimate_center_auto
 from .io import load_image, rgb_to_gray_u8
 from .speed_scale import speed_scale_from_spindle_radius
-from .trace import extract_needle_mask, extract_speed_trace, estimate_speed_scale_radii, fixed_speed_band_from_outer_radius
+from .trace import (
+    detect_noon12_angle_debug,
+    extract_needle_mask,
+    extract_speed_trace,
+    estimate_speed_scale_radii,
+    fixed_speed_band_from_outer_radius,
+)
 
 
 def _default_r_range(est) -> tuple[int, int]:
@@ -48,6 +54,25 @@ def main() -> int:
     parser.add_argument("--speed-vmax-kmh", type=float, default=None)
     parser.add_argument("--needle-speed-vmax-kmh", type=float, default=120.0)
 
+    parser.add_argument("--time-ring-out-margin", type=int, default=10)
+    parser.add_argument("--time-ring-thickness", type=int, default=90)
+    parser.add_argument("--time-ring-r-out-ratio", type=float, default=None)
+    parser.add_argument("--time-ring-thickness-ratio", type=float, default=None)
+    parser.add_argument("--time-ring-refine-outer-radius", action="store_true")
+    parser.add_argument("--time-ring-polar-width", type=int, default=2400)
+    parser.add_argument("--time-ring-angle-flip", action="store_true")
+    parser.add_argument("--time-ring-use-green", action="store_true")
+    parser.add_argument("--time-ring-template-12", type=str, default=None)
+    parser.add_argument("--time-ring-template-12-from-mark", type=str, default=None)
+    parser.add_argument("--time-ring-template-12-out", type=str, default=None)
+    parser.add_argument("--time-ring-min-score", type=float, default=0.35)
+    parser.add_argument("--manual-noon-angle-deg", type=float, default=None)
+    parser.add_argument(
+        "--noon-from-needle-binary",
+        action="store_true",
+        help="Fallback: estimate 00:00 direction from the white sector in needle_binary, then set 12:00 at +180deg",
+    )
+
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--debug-image", default=None)
     parser.add_argument("--debug-trace-mask", default=None)
@@ -74,7 +99,154 @@ def main() -> int:
 
     loaded = load_image(args.input, pdf_page_index=args.pdf_page, pdf_dpi=args.pdf_dpi)
     gray = rgb_to_gray_u8(loaded.rgb)
+    time_gray = gray
+    if bool(args.time_ring_use_green):
+        rgb = loaded.rgb
+        r = rgb[:, :, 0].astype(np.float32)
+        g = rgb[:, :, 1].astype(np.float32)
+        b = rgb[:, :, 2].astype(np.float32)
+        # Emphasize green ink relative to background.
+        v = (g - 0.55 * r - 0.55 * b)
+        v = (v - float(np.percentile(v, 1.0)))
+        v = v / float(max(1e-6, np.percentile(v, 99.0)))
+        v = (v * 255.0).clip(0, 255).astype(np.uint8)
+        time_gray = v
     est = estimate_center_auto(gray)
+
+    noon_det = None
+    theta_noon_deg = None
+    if args.manual_noon_angle_deg is not None:
+        theta_noon_deg = float(args.manual_noon_angle_deg) % 360.0
+    else:
+        templ_bin = None
+        if args.time_ring_template_12_from_mark:
+            if est.outer_radius is None:
+                raise ValueError("--time-ring-template-12-from-mark requires a valid outer_radius")
+
+            # First, compute polar band/bin without a template.
+            noon_no_template = detect_noon12_angle_debug(
+                time_gray,
+                refine_gray_u8=gray,
+                center_xy=(est.center_x, est.center_y),
+                outer_radius=float(est.outer_radius),
+                time_ring_out_margin=int(args.time_ring_out_margin),
+                time_ring_thickness=int(args.time_ring_thickness),
+                time_ring_r_out_ratio=args.time_ring_r_out_ratio,
+                time_ring_thickness_ratio=args.time_ring_thickness_ratio,
+                time_ring_refine_outer_radius=bool(args.time_ring_refine_outer_radius),
+                polar_width=int(args.time_ring_polar_width),
+                template_12_bin_u8=None,
+                min_score=float(args.time_ring_min_score),
+                angle_flip=bool(args.time_ring_angle_flip),
+            )
+
+            dbg0 = noon_no_template.debug if isinstance(noon_no_template.debug, dict) else {}
+            r_in = int(dbg0.get("r_in", 0))
+            r_out = int(dbg0.get("r_out", 0))
+            W = int(dbg0.get("polar_width", 0))
+            if r_in <= 0 or r_out <= r_in + 2 or W <= 0:
+                raise ValueError("failed to get valid polar band geometry for template extraction")
+
+            mark_path = str(args.time_ring_template_12_from_mark)
+            mark_bgr = cv2.imread(mark_path, cv2.IMREAD_COLOR)
+            if mark_bgr is None:
+                raise ValueError(f"failed to read --time-ring-template-12-from-mark: {mark_path}")
+
+            hsv = cv2.cvtColor(mark_bgr, cv2.COLOR_BGR2HSV)
+            # Do not assume the marker color is pure red. In practice, depending on the editor/
+            # color profile, the rectangle may appear with a different hue.
+            # We instead pick highly saturated pixels.
+            s = hsv[:, :, 1]
+            v = hsv[:, :, 2]
+            mark_mask = (((s.astype(np.int16) >= 120) & (v.astype(np.int16) >= 120))).astype(np.uint8) * 255
+            mark_mask = cv2.morphologyEx(mark_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+
+            # Restrict to the time-ring annulus to avoid picking red printed rings/text.
+            mh, mw = mark_mask.shape[:2]
+            yy, xx = np.indices((mh, mw), dtype=np.float32)
+            rr0 = np.hypot(xx - float(est.center_x), yy - float(est.center_y))
+            r_lo = max(0.0, float(r_in) - 40.0)
+            r_hi = float(r_out) + 40.0
+            ann = ((rr0 >= r_lo) & (rr0 <= r_hi)).astype(np.uint8) * 255
+            mark_mask = cv2.bitwise_and(mark_mask, ann)
+
+            # Keep only the largest connected component (expected to be the rectangle).
+            nlab, lab, stats, _ = cv2.connectedComponentsWithStats((mark_mask > 0).astype(np.uint8), connectivity=8)
+            if nlab <= 1:
+                raise ValueError("mark rectangle not found in marked image (no components)")
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            k = int(np.argmax(areas)) + 1
+            if int(stats[k, cv2.CC_STAT_AREA]) < 200:
+                raise ValueError("mark rectangle not found in marked image (component too small)")
+            mark_mask = (lab == k).astype(np.uint8) * 255
+            # Thicken lines so warpPolar keeps a usable bbox even if the rectangle is drawn thin.
+            mark_mask = cv2.dilate(mark_mask, np.ones((5, 5), np.uint8), iterations=1)
+
+            cx = float(est.center_x)
+            cy = float(est.center_y)
+            polar_red = cv2.warpPolar(
+                mark_mask,
+                (int(W), int(r_out)),
+                (cx, cy),
+                maxRadius=float(r_out),
+                flags=cv2.WARP_POLAR_LINEAR + cv2.WARP_FILL_OUTLIERS,
+            )
+            polar_red_band = polar_red[int(r_in) : int(r_out), :]
+            ys, xs = np.where(polar_red_band > 0)
+            if xs.size < 50:
+                raise ValueError("mark rectangle not found in marked image (too few pixels after warpPolar)")
+
+            x0, x1 = int(xs.min()), int(xs.max())
+            y0, y1 = int(ys.min()), int(ys.max())
+
+            # Expand the bbox a bit to avoid clipping the digit strokes.
+            bw = max(0, x1 - x0 + 1)
+            bh = max(0, y1 - y0 + 1)
+            pad = int(min(14, max(4, min(bw, bh) // 6)))
+            x0 = max(0, x0 - pad)
+            y0 = max(0, y0 - pad)
+            x1 = min(int(W) - 1, x1 + pad)
+            y1 = min(int(r_out - r_in) - 1, y1 + pad)
+            if x1 <= x0 + 4 or y1 <= y0 + 4:
+                raise ValueError("mark bbox too small; cannot build template")
+
+            templ_gray = noon_no_template.polar_band[y0 : y1 + 1, x0 : x1 + 1].copy()
+            if templ_gray.ndim != 2 or templ_gray.dtype != np.uint8:
+                raise ValueError("failed to crop grayscale template region")
+
+            # Save as grayscale template. trace.py will automatically choose grayscale matching
+            # (template has >2 unique values) which preserves digit shapes better than binarization.
+            p2 = cv2.normalize(templ_gray, None, 0, 255, cv2.NORM_MINMAX)
+            templ_bin = p2.astype(np.uint8)
+            out_path = str(args.time_ring_template_12_out) if args.time_ring_template_12_out else None
+            if not out_path:
+                raise ValueError("--time-ring-template-12-from-mark requires --time-ring-template-12-out")
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(out_path, templ_bin)
+
+        if args.time_ring_template_12:
+            tpath = str(args.time_ring_template_12)
+            templ = cv2.imread(tpath, cv2.IMREAD_GRAYSCALE)
+            if templ is None:
+                raise ValueError(f"failed to read --time-ring-template-12: {tpath}")
+            templ_bin = templ
+        if est.outer_radius is not None:
+            noon_det = detect_noon12_angle_debug(
+                time_gray,
+                refine_gray_u8=gray,
+                center_xy=(est.center_x, est.center_y),
+                outer_radius=float(est.outer_radius),
+                time_ring_out_margin=int(args.time_ring_out_margin),
+                time_ring_thickness=int(args.time_ring_thickness),
+                time_ring_r_out_ratio=args.time_ring_r_out_ratio,
+                time_ring_thickness_ratio=args.time_ring_thickness_ratio,
+                time_ring_refine_outer_radius=bool(args.time_ring_refine_outer_radius),
+                polar_width=int(args.time_ring_polar_width),
+                template_12_bin_u8=templ_bin,
+                min_score=float(args.time_ring_min_score),
+                angle_flip=bool(args.time_ring_angle_flip),
+            )
+            theta_noon_deg = noon_det.theta_noon_deg
 
     speed_band_uncertain = False
     speed_band_debug = None
@@ -193,6 +365,35 @@ def main() -> int:
         min_aspect=float(args.needle_min_aspect),
     )
 
+    # Fallback: estimate time anchor from cutout/white sector in needle binary.
+    needle_midnight_deg = None
+    needle_anchor_dbg = None
+    if theta_noon_deg is None and bool(args.noon_from_needle_binary):
+        m = needle.binary_mask_u8
+        if m is not None and m.ndim == 2 and m.dtype == np.uint8:
+            ys, xs = np.where(m > 0)
+            if xs.size >= 200:
+                cx = float(est.center_x)
+                cy = float(est.center_y)
+                dx = xs.astype(np.float32) - cx
+                dy = ys.astype(np.float32) - cy
+                ang = (np.degrees(np.arctan2(dy, dx)) + 360.0) % 360.0
+                # Use 1deg histogram, smoothed, pick dominant direction.
+                bins = np.floor(ang).astype(np.int32) % 360
+                hist = np.bincount(bins, minlength=360).astype(np.float32)
+                hist_s = cv2.GaussianBlur(hist.reshape(1, -1), (0, 0), 2.0).reshape(-1)
+                k = int(np.argmax(hist_s))
+                needle_midnight_deg = float(k)
+                theta_noon_deg = float((needle_midnight_deg + 180.0) % 360.0)
+                needle_anchor_dbg = {
+                    "method": "needle_binary_white_sector",
+                    "white_pixel_count": int(xs.size),
+                    "midnight_angle_deg": float(needle_midnight_deg),
+                    "noon_angle_deg": float(theta_noon_deg),
+                    "hist_peak": int(k),
+                    "hist_peak_value": float(hist_s[k]),
+                }
+
     out = {
         "source": str(Path(loaded.source_path)),
         "center": {"x": est.center_x, "y": est.center_y},
@@ -214,8 +415,22 @@ def main() -> int:
         },
     }
 
+    if theta_noon_deg is not None:
+        out["noon12_angle_deg"] = float(theta_noon_deg)
+        method = "noon12" if noon_det is not None and noon_det.theta_noon_deg is not None else "needle_binary"
+        out["time_angle_correction"] = {"method": str(method), "anchor_time": "12:00:00", "anchor_angle_deg": float(theta_noon_deg)}
+    elif args.manual_noon_angle_deg is not None:
+        out["noon12_angle_deg"] = float(args.manual_noon_angle_deg) % 360.0
+        out["time_angle_correction"] = {"method": "manual", "anchor_time": "12:00:00", "anchor_angle_deg": float(out["noon12_angle_deg"])}
+    else:
+        out["time_angle_correction"] = {"method": "fallback", "reason": "no_noon12_angle"}
+
     if bool(args.debug):
         out["center_debug"] = dict(est.debug) if isinstance(est.debug, dict) else {}
+        if noon_det is not None:
+            out["noon12_debug"] = dict(noon_det.debug) if isinstance(noon_det.debug, dict) else {}
+        if needle_anchor_dbg is not None:
+            out["needle_time_anchor_debug"] = dict(needle_anchor_dbg)
         if speed_band_debug is not None:
             out["speed_band_debug"] = dict(speed_band_debug) if isinstance(speed_band_debug, dict) else speed_band_debug
         if speed_scale_est is not None:
@@ -276,6 +491,10 @@ def main() -> int:
         debug_needle_roi_path = debug_image_path.with_name(debug_image_path.stem + "_needle_roi.png")
         debug_needle_roi_mask_path = debug_image_path.with_name(debug_image_path.stem + "_needle_roi_mask.png")
         debug_needle_binary_path = debug_image_path.with_name(debug_image_path.stem + "_needle_binary.png")
+        debug_polar_band_path = debug_image_path.with_name(debug_image_path.stem + "_polar_band.png")
+        debug_polar_band_bin_path = debug_image_path.with_name(debug_image_path.stem + "_polar_band_bin.png")
+        debug_match_12_path = debug_image_path.with_name(debug_image_path.stem + "_match_12.png")
+        debug_noon_overlay_path = debug_image_path.with_name(debug_image_path.stem + "_noon_overlay.png")
 
         bgr_base = cv2.cvtColor(loaded.rgb, cv2.COLOR_RGB2BGR)
         cx = float(est.center_x)
@@ -298,8 +517,18 @@ def main() -> int:
 
         bgr_ann = bgr_base.copy()
         draw_center_and_outer(bgr_ann)
-        cv2.circle(bgr_ann, (int(round(cx)), int(round(cy))), int(round(r_min)), (255, 0, 0), 2)
-        cv2.circle(bgr_ann, (int(round(cx)), int(round(cy))), int(round(r_max)), (255, 0, 0), 2)
+        ann_r_in = int(r_min)
+        ann_r_out = int(r_max)
+        if "needle_roi" in out and isinstance(out["needle_roi"], dict):
+            nr_in = int(out["needle_roi"].get("r_in", 0))
+            nr_out = int(out["needle_roi"].get("r_out", 0))
+            if nr_in > 0 and nr_out > nr_in:
+                ann_r_in = nr_in
+                ann_r_out = nr_out
+        ann_color = (0, 255, 255)
+        ann_thickness = 2
+        cv2.circle(bgr_ann, (int(round(cx)), int(round(cy))), int(round(ann_r_in)), ann_color, int(ann_thickness))
+        cv2.circle(bgr_ann, (int(round(cx)), int(round(cy))), int(round(ann_r_out)), ann_color, int(ann_thickness))
 
         bgr = bgr_ann.copy()
 
@@ -373,6 +602,34 @@ def main() -> int:
         # needle binary mask visualization
         cv2.imwrite(str(debug_needle_binary_path), needle.binary_mask_u8)
 
+        if noon_det is not None:
+            cv2.imwrite(str(debug_polar_band_path), noon_det.polar_band)
+            cv2.imwrite(str(debug_polar_band_bin_path), noon_det.polar_band_bin)
+            if noon_det.match_vis is not None:
+                cv2.imwrite(str(debug_match_12_path), noon_det.match_vis)
+
+        # noon overlay (even if using manual override)
+        if theta_noon_deg is not None:
+            bgr_noon = bgr_base.copy()
+            draw_center_and_outer(bgr_noon)
+            theta = float(theta_noon_deg)
+            rad = np.deg2rad(float(theta))
+            R = float(est.outer_radius) if est.outer_radius is not None else float(min(bgr_noon.shape[0], bgr_noon.shape[1]) * 0.45)
+            x1 = float(cx) + float(R) * float(np.cos(rad))
+            y1 = float(cy) + float(R) * float(np.sin(rad))
+            cv2.line(bgr_noon, (int(round(cx)), int(round(cy))), (int(round(x1)), int(round(y1))), (0, 0, 255), 3)
+            cv2.putText(
+                bgr_noon,
+                f"NOON12 {theta:.1f}deg",
+                (20, 90),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.2,
+                (0, 0, 255),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.imwrite(str(debug_noon_overlay_path), bgr_noon)
+
         cv2.imwrite(str(debug_image_path), bgr)
         out["debug_outer_circle"] = str(debug_outer_path)
         out["debug_speed_band_annulus"] = str(debug_annulus_path)
@@ -381,6 +638,13 @@ def main() -> int:
         out["debug_needle_roi"] = str(debug_needle_roi_path)
         out["debug_needle_roi_mask"] = str(debug_needle_roi_mask_path)
         out["debug_needle_binary"] = str(debug_needle_binary_path)
+        if noon_det is not None:
+            out["debug_polar_band"] = str(debug_polar_band_path)
+            out["debug_polar_band_bin"] = str(debug_polar_band_bin_path)
+            if noon_det.match_vis is not None:
+                out["debug_match_12"] = str(debug_match_12_path)
+        if theta_noon_deg is not None:
+            out["debug_noon_overlay"] = str(debug_noon_overlay_path)
         out["debug_image"] = str(debug_image_path)
 
         if args.debug_trace_mask is not None:
@@ -397,8 +661,9 @@ def main() -> int:
                 markerSize=40,
                 thickness=3,
             )
-            cv2.circle(mask, (int(round(cx)), int(round(cy))), int(round(r_min)), (255, 0, 0), 2)
-            cv2.circle(mask, (int(round(cx)), int(round(cy))), int(round(r_max)), (255, 0, 0), 2)
+            ann_color = (0, 255, 255)
+            cv2.circle(mask, (int(round(cx)), int(round(cy))), int(round(r_min)), ann_color, 2)
+            cv2.circle(mask, (int(round(cx)), int(round(cy))), int(round(r_max)), ann_color, 2)
             mask_path.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(mask_path), mask)
             out["debug_trace_mask"] = str(mask_path)
