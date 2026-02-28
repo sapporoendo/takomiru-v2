@@ -10,3 +10,12 @@ venv/
 dist/
 build/
 *.egg-info/
+
+output/
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.webp
+*.tif
+*.tiff
