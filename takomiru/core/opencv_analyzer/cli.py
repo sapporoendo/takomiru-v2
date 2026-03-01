@@ -90,14 +90,18 @@ def main() -> int:
     parser.add_argument("inputs", nargs="+", help="Input image/PDF path(s) or a directory")
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--prefer-hough", type=int, default=1)
+    parser.add_argument("--wobble-refine", type=int, default=0)
     parser.add_argument("--write-normalized", type=int, default=1)
     parser.add_argument("--write-polar", type=int, default=1)
     parser.add_argument("--write-bands", type=int, default=1)
     parser.add_argument("--normalize", type=int, default=1)
     parser.add_argument("--polar-width", type=int, default=1440)
 
-    parser.add_argument("--speed-r-in-frac", type=float, default=0.78)
-    parser.add_argument("--speed-r-out-frac", type=float, default=0.97)
+    parser.add_argument("--polar-theta-start-frac", type=float, default=0.5)
+    parser.add_argument("--polar-theta-end-frac", type=float, default=1.0)
+
+    parser.add_argument("--speed-r-in-frac", type=float, default=0.80)
+    parser.add_argument("--speed-r-out-frac", type=float, default=0.95)
     parser.add_argument("--distance-r-in-frac", type=float, default=0.58)
     parser.add_argument("--distance-r-out-frac", type=float, default=0.76)
 
@@ -125,14 +129,18 @@ def main() -> int:
                 try:
                     payload = _process_one(
                         name=page_name,
+                        base_name=str(page_name),
                         img=bgr,
                         out_dir=out_dir,
                         prefer_hough=bool(int(args.prefer_hough)),
+                        wobble_refine=bool(int(args.wobble_refine)),
                         write_normalized=bool(int(args.write_normalized)),
                         write_polar=bool(int(args.write_polar)),
                         write_bands=bool(int(args.write_bands)),
                         normalize=bool(int(args.normalize)),
                         polar_width=int(args.polar_width),
+                        polar_theta_start_frac=float(args.polar_theta_start_frac),
+                        polar_theta_end_frac=float(args.polar_theta_end_frac),
                         speed_r_in_frac=float(args.speed_r_in_frac),
                         speed_r_out_frac=float(args.speed_r_out_frac),
                         distance_r_in_frac=float(args.distance_r_in_frac),
@@ -161,14 +169,18 @@ def main() -> int:
                 img = load_image_bgr(str(p))
                 payload = _process_one(
                     name=str(p),
+                    base_name=str(_safe_name(p)),
                     img=img,
                     out_dir=out_dir,
                     prefer_hough=bool(int(args.prefer_hough)),
+                    wobble_refine=bool(int(args.wobble_refine)),
                     write_normalized=bool(int(args.write_normalized)),
                     write_polar=bool(int(args.write_polar)),
                     write_bands=bool(int(args.write_bands)),
                     normalize=bool(int(args.normalize)),
                     polar_width=int(args.polar_width),
+                    polar_theta_start_frac=float(args.polar_theta_start_frac),
+                    polar_theta_end_frac=float(args.polar_theta_end_frac),
                     speed_r_in_frac=float(args.speed_r_in_frac),
                     speed_r_out_frac=float(args.speed_r_out_frac),
                     distance_r_in_frac=float(args.distance_r_in_frac),
@@ -212,6 +224,7 @@ def _summary_row(*, input_path: str, name: str, payload: dict) -> dict:
         "input_path": str(input_path),
         "name": str(name),
         "out_dir": str(payload.get("out_dir")),
+        "polar_path": str(payload.get("polar_path", "")),
         "ok": True,
         "cx": float(payload.get("cx")),
         "cy": float(payload.get("cy")),
@@ -227,6 +240,7 @@ def _write_summary_csv(path: Path, rows: List[dict]) -> None:
         "input_path",
         "name",
         "out_dir",
+        "polar_path",
         "ok",
         "cx",
         "cy",
@@ -247,20 +261,24 @@ def _write_summary_csv(path: Path, rows: List[dict]) -> None:
 def _process_one(
     *,
     name: str,
+    base_name: str,
     img: np.ndarray,
     out_dir: Path,
     prefer_hough: bool,
+    wobble_refine: bool,
     write_normalized: bool,
     write_polar: bool,
     write_bands: bool,
     normalize: bool,
     polar_width: int,
+    polar_theta_start_frac: float,
+    polar_theta_end_frac: float,
     speed_r_in_frac: float,
     speed_r_out_frac: float,
     distance_r_in_frac: float,
     distance_r_out_frac: float,
 ) -> dict:
-    res = detect_tachograph_circle(img, prefer_hough=prefer_hough)
+    res = detect_tachograph_circle(img, prefer_hough=prefer_hough, wobble_refine=bool(wobble_refine))
 
     annotated = img.copy()
     cv2.circle(
@@ -298,6 +316,8 @@ def _process_one(
         circle=res,
         normalize=normalize,
         polar_width=int(polar_width),
+        polar_theta_start_frac=float(polar_theta_start_frac),
+        polar_theta_end_frac=float(polar_theta_end_frac),
         speed_r_in_frac=float(speed_r_in_frac),
         speed_r_out_frac=float(speed_r_out_frac),
         distance_r_in_frac=float(distance_r_in_frac),
@@ -305,7 +325,11 @@ def _process_one(
     )
 
     if write_polar:
-        cv2.imwrite(str(out_dir / "polar.png"), unwrap.polar_bgr)
+        polar_filename = f"{str(base_name)}_polar.png"
+        cv2.imwrite(str(out_dir / polar_filename), unwrap.polar_bgr)
+        polar_path = str(out_dir / polar_filename)
+    else:
+        polar_path = ""
     if write_bands:
         cv2.imwrite(str(out_dir / "band_speed.png"), unwrap.speed_band_bgr)
         cv2.imwrite(str(out_dir / "band_distance.png"), unwrap.distance_band_bgr)
@@ -313,6 +337,7 @@ def _process_one(
     payload = {
         "name": name,
         "out_dir": str(out_dir),
+        "polar_path": polar_path,
         "cx": res.cx,
         "cy": res.cy,
         "r": res.r,

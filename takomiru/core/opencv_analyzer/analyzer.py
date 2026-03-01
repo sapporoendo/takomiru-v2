@@ -236,6 +236,19 @@ def _circle_from_white_paper_blob(bgr: np.ndarray) -> Tuple[Optional[CircleCandi
     return cand, dbg, dbg_images
 
 
+def _circle_from_red_speed_ring_retry(bgr: np.ndarray) -> Tuple[Optional[CircleCandidate], Dict[str, object], Dict[str, np.ndarray]]:
+    """Retry red ring detection without any hint/annulus restriction.
+
+    This is used when the paper hint is unreliable (e.g., paper radius guard fails) or
+    when annulus restriction leads to no candidates.
+    """
+
+    cand, dbg, imgs = _circle_from_red_speed_ring(bgr, cx_hint=None, cy_hint=None, r_hint=None)
+    dbg = dict(dbg)
+    dbg["retry"] = True
+    return cand, dbg, imgs
+
+
 def _circle_from_red_speed_ring(
     bgr: np.ndarray,
     *,
@@ -260,6 +273,7 @@ def _circle_from_red_speed_ring(
     mask = cv2.bitwise_or(mask1, mask2)
 
     # If we have a paper circle hint, restrict detection to an annulus to avoid the red pointer.
+    # Note: if the hint is inaccurate, this can hide the ring; caller handles retry without hint.
     ring_mask = None
     if (cx_hint is not None) and (cy_hint is not None) and (r_hint is not None) and (r_hint > 1.0):
         ring_mask = np.zeros((h, w), dtype=np.uint8)
@@ -847,12 +861,14 @@ def detect_tachograph_circle(
     image_bgr: np.ndarray,
     *,
     prefer_hough: bool = True,
+    wobble_refine: bool = False,
 ) -> CircleDetectionResult:
     bgr = _as_bgr(image_bgr)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
     dbg_images: Dict[str, np.ndarray] = {}
-    guard = {"r_rel_min": 0.33, "r_rel_max": 0.52}
+    # Radius guard: keep it loose enough to avoid unnecessary fallbacks.
+    guard = {"r_rel_min": 0.30, "r_rel_max": 0.62}
     h, w = gray.shape[:2]
     m = float(min(h, w))
 
@@ -866,6 +882,13 @@ def detect_tachograph_circle(
         r_hint=(None if paper_cand is None else float(paper_cand.r)),
     )
     dbg_images.update(red_imgs)
+
+    # If annulus constraint caused miss, retry without hint.
+    if (red_cand is None) and isinstance(red_dbg, dict) and (red_dbg.get("status") in {"no_candidate", "no_contour"}):
+        red2, red2_dbg, red2_imgs = _circle_from_red_speed_ring_retry(bgr)
+        if red2 is not None:
+            red_cand, red_dbg = red2, red2_dbg
+            dbg_images.update(red2_imgs)
 
     best = None
     candidates: Tuple[CircleCandidate, ...] = ()
@@ -898,9 +921,9 @@ def detect_tachograph_circle(
         paper_dbg = dict(paper_dbg)
         paper_dbg["rr_ok"] = bool(rr_ok)
         paper_dbg["r_rel"] = float(paper_cand.r) / float(max(1.0, m))
-        if rr_ok:
-            best = paper_cand
-            candidates = (paper_cand,)
+        # Even if guard fails, prefer paper over hard fallback; it keeps center/radius closer to reality.
+        best = paper_cand
+        candidates = (paper_cand,)
 
     if best is None and red_cand is not None:
         # If only red ring is available, expand slightly to approximate outer boundary.
@@ -926,6 +949,17 @@ def detect_tachograph_circle(
         best = CircleCandidate(cx=float(w) / 2.0, cy=float(h) / 2.0, r=0.45 * m, score=0.0, method="fallback")
         candidates = (best,)
 
+    wobble_dbg: Dict[str, object] = {"status": "skip"}
+    if bool(wobble_refine) and str(best.method) != "fallback":
+        # Optional: Subpixel-ish refinement to reduce wobble in polar bands.
+        cx2, cy2, wobble_dbg = refine_center_by_polar_wobble(
+            bgr,
+            cx=float(best.cx),
+            cy=float(best.cy),
+            r=float(best.r),
+        )
+        best = CircleCandidate(cx=float(cx2), cy=float(cy2), r=float(best.r), score=float(best.score), method=str(best.method))
+
     ellipse_fit, ellipse_score, ellipse_dbg = _fit_ellipse_from_edges(gray)
     mask_ellipse_fit, mask_ellipse_score, mask_ellipse_dbg = _fit_ellipse_from_paper_mask(bgr)
     hole_dbg = _refine_center_by_hole(gray, cx=float(best.cx), cy=float(best.cy), r=float(best.r))[2]
@@ -939,6 +973,7 @@ def detect_tachograph_circle(
         "status": "ok",
         "paper": dict(paper_dbg),
         "red": dict(red_dbg),
+        "wobble_refine": dict(wobble_dbg),
         "ellipse": dict(ellipse_dbg),
         "mask_ellipse": dict(mask_ellipse_dbg),
         "hole": dict(hole_dbg),
@@ -1058,6 +1093,89 @@ def extract_ring_band_from_polar(
     return polar_bgr[y0:y1, :, :]
 
 
+def _horizontal_edge_score(band_bgr: np.ndarray) -> float:
+    g = cv2.cvtColor(_as_bgr(band_bgr), cv2.COLOR_BGR2GRAY)
+    g = cv2.GaussianBlur(g, (3, 3), 0)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    # Horizontal edges have mostly vertical gradient => |gy| >> |gx|
+    denom = cv2.abs(gx) + cv2.abs(gy) + 1e-6
+    ratio = cv2.abs(gy) / denom
+    # Focus on stronger edges to avoid background noise.
+    thr = float(np.percentile(mag, 92.0))
+    mask = (mag >= thr).astype(np.float32)
+    return float((mag * ratio * mask).sum())
+
+
+def refine_center_by_polar_wobble(
+    image_bgr: np.ndarray,
+    *,
+    cx: float,
+    cy: float,
+    r: float,
+    speed_r_in_frac: float = 0.75,
+    speed_r_out_frac: float = 0.95,
+    polar_width: int = 720,
+    search_radius_px: float = 3.0,
+    step_px: float = 0.5,
+    downscale: float = 0.5,
+) -> Tuple[float, float, Dict[str, object]]:
+    """Refine center by maximizing 'horizontalness' of edges in speed band in polar domain.
+
+    This aims to reduce wobble in band_speed caused by slight center errors.
+    """
+
+    if r <= 1.0:
+        return float(cx), float(cy), {"status": "bad_r"}
+
+    img = _as_bgr(image_bgr)
+    h, w = img.shape[:2]
+    ds = float(np.clip(float(downscale), 0.2, 1.0))
+    if ds < 1.0:
+        img = cv2.resize(img, (int(round(w * ds)), int(round(h * ds))), interpolation=cv2.INTER_AREA)
+    cx0 = float(cx) * ds
+    cy0 = float(cy) * ds
+    r0 = float(r) * ds
+
+    best = (float(cx0), float(cy0))
+    best_score = float("-inf")
+
+    offsets = np.arange(-float(search_radius_px), float(search_radius_px) + 1e-9, float(step_px), dtype=np.float32)
+    for dx in offsets:
+        for dy in offsets:
+            cxx = float(cx0 + float(dx))
+            cyy = float(cy0 + float(dy))
+            polar = unwrap_polar_linear(img, center_xy=(cxx, cyy), max_radius_px=float(r0), out_width=int(polar_width))
+            r_in = float(r0) * float(speed_r_in_frac)
+            r_out = float(r0) * float(speed_r_out_frac)
+            band = extract_ring_band_from_polar(polar, r_in_px=r_in, r_out_px=r_out)
+            s = _horizontal_edge_score(band)
+            if s > best_score:
+                best_score = float(s)
+                best = (float(cxx), float(cyy))
+
+    cx1 = float(best[0]) / ds
+    cy1 = float(best[1]) / ds
+    dbg = {
+        "status": "ok",
+        "cx_in": float(cx),
+        "cy_in": float(cy),
+        "cx_out": float(cx1),
+        "cy_out": float(cy1),
+        "best_score": float(best_score),
+        "params": {
+            "speed_r_in_frac": float(speed_r_in_frac),
+            "speed_r_out_frac": float(speed_r_out_frac),
+            "polar_width": int(polar_width),
+            "search_radius_px": float(search_radius_px),
+            "step_px": float(step_px),
+            "downscale": float(ds),
+        },
+    }
+    return float(cx1), float(cy1), dbg
+
+
 @dataclass(frozen=True)
 class RingUnwrapResult:
     normalized_bgr: np.ndarray
@@ -1071,12 +1189,14 @@ def unwrap_speed_and_distance_rings(
     image_bgr: np.ndarray,
     *,
     circle: CircleDetectionResult,
-    normalize: bool = True,
-    polar_width: int = 1440,
-    speed_r_in_frac: float = 0.78,
-    speed_r_out_frac: float = 0.97,
-    distance_r_in_frac: float = 0.58,
-    distance_r_out_frac: float = 0.76,
+    normalize: bool,
+    polar_width: int,
+    polar_theta_start_frac: float = 0.5,
+    polar_theta_end_frac: float = 1.0,
+    speed_r_in_frac: float,
+    speed_r_out_frac: float,
+    distance_r_in_frac: float,
+    distance_r_out_frac: float,
 ) -> RingUnwrapResult:
     """Prototype ring unwrapping for both speed and distance bands.
 
@@ -1114,24 +1234,39 @@ def unwrap_speed_and_distance_rings(
         center = (float(circle.cx), float(circle.cy))
         max_r = float(circle.r)
 
-    polar = unwrap_polar_linear(norm, center_xy=center, max_radius_px=max_r, out_width=int(polar_width))
+    polar_full = unwrap_polar_linear(norm, center_xy=(float(center[0]), float(center[1])), max_radius_px=float(max_r), out_width=int(polar_width))
+
+    w = int(polar_full.shape[1])
+    a0 = float(np.clip(float(polar_theta_start_frac), 0.0, 1.0))
+    a1 = float(np.clip(float(polar_theta_end_frac), 0.0, 1.0))
+    if a1 <= a0:
+        a0, a1 = 0.0, 1.0
+    x0 = int(round(a0 * float(w)))
+    x1 = int(round(a1 * float(w)))
+    x0 = int(np.clip(x0, 0, w - 1))
+    x1 = int(np.clip(x1, x0 + 1, w))
+    polar_full = polar_full[:, x0:x1].copy()
 
     r_speed_in = float(max_r) * float(speed_r_in_frac)
     r_speed_out = float(max_r) * float(speed_r_out_frac)
     r_dist_in = float(max_r) * float(distance_r_in_frac)
     r_dist_out = float(max_r) * float(distance_r_out_frac)
 
-    speed_band = extract_ring_band_from_polar(polar, r_in_px=r_speed_in, r_out_px=r_speed_out)
-    dist_band = extract_ring_band_from_polar(polar, r_in_px=r_dist_in, r_out_px=r_dist_out)
+    band_speed = extract_ring_band_from_polar(polar_full, r_in_px=float(r_speed_in), r_out_px=float(r_speed_out))
+    band_dist = extract_ring_band_from_polar(polar_full, r_in_px=float(r_dist_in), r_out_px=float(r_dist_out))
+
+    polar = polar_full
 
     return RingUnwrapResult(
         normalized_bgr=norm,
         polar_bgr=polar,
-        speed_band_bgr=speed_band,
-        distance_band_bgr=dist_band,
+        speed_band_bgr=band_speed,
+        distance_band_bgr=band_dist,
         params={
             "normalize": bool(normalize),
             "polar_width": int(polar_width),
+            "polar_theta_start_frac": float(a0),
+            "polar_theta_end_frac": float(a1),
             "max_radius_px": float(max_r),
             "speed": {
                 "r_in_frac": float(speed_r_in_frac),
@@ -1145,6 +1280,6 @@ def unwrap_speed_and_distance_rings(
                 "r_in_px": float(r_dist_in),
                 "r_out_px": float(r_dist_out),
             },
+            "polar_mode": "full",
         },
     )
-
