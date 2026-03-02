@@ -1,0 +1,219 @@
+# タコグラフ自動デジタル化プロジェクト — Claude 引き継ぎ指示書
+
+## プロジェクト概要
+
+アナログタコグラフ（円形チャート紙）をスマホで撮影し、OpenCVによる画像処理で速度データ（km/h）を時系列CSVとして自動抽出するシステム。
+
+**現在のコードベース:** Windsurf + Gemini で開発済み。今後は Claude で開発を継続。  
+**Gitコミット参照:** `bd870a7`
+
+---
+
+## ファイル構成と役割
+
+| ファイル | 役割 |
+|---|---|
+| `analyzer.py` | メインパイプライン。円検出 → 正規化 → 極座標展開（`unwrap_speed_and_distance_rings`） |
+| `trace.py` | 速度軌跡の抽出コア。Viterbi法・greedy法による針跡追跡、速度スケール推定 |
+| `cli_batch.py` | バッチ処理CLI。複数画像/PDFを一括処理してCSV・JSONを出力 |
+| `cli_trace.py` | 単画像トレースCLI。針マスク・debug画像の生成 |
+
+---
+
+## 確立済みの「黄金ロジック」（変更禁止）
+
+以下のパラメータはすでに実運用で検証済み。**変更しないこと。**
+
+```
+速度記録帯の切り出し範囲:
+  speed_r_in_frac  = 0.80  (半径の80%)
+  speed_r_out_frac = 0.95  (半径の95%)
+
+展開角度:
+  polar_theta_start_frac = 0.5  (チャート右半分のみ: 1時〜24時エリア)
+  polar_theta_end_frac   = 1.0
+
+出力ファイル命名:
+  {元ファイル名}_polar.png
+
+極座標展開レイアウト:
+  縦軸 = 時刻（1時〜24時）、右端に時刻数字
+  横軸 = 速度（左から右）、80km/h・100km/hの赤色補助線入り
+```
+
+---
+
+## 現状の処理パイプライン
+
+```
+[スマホ撮影] 
+    ↓
+[detect_tachograph_circle]  ← analyzer.py
+    - 白い紙マスクで円検出（paper_blob）
+    - 赤リングで中心精度を補正（red_speed_ring）
+    - Hough変換フォールバック
+    ↓
+[unwrap_speed_and_distance_rings]  ← analyzer.py
+    - 極座標変換（warpPolar）
+    - 速度帯・距離帯をスライス
+    ↓
+[extract_speed_trace]  ← trace.py
+    - 各角度ごとに半径方向の輝度プロファイルをスキャン
+    - Viterbi法で針跡を連続的に追跡
+    ↓
+[polar.png 出力]
+```
+
+---
+
+## 速度検出精度の現状課題と改善タスク
+
+### 課題1: 赤補助線（80km/h・100km/h）の自動キャリブレーション
+
+**現状:** 赤ラインのピクセル座標が手動設定  
+**目標:** 極座標展開画像（polar.png）から赤ラインのx座標を自動検出し、ピクセル→km/h変換スケールを自動生成
+
+**実装指針:**
+```python
+# polar.png のBGR画像から赤チャンネルの強度プロファイルを列ごとに集計
+# HSV変換で赤色ピクセルをマスク: H∈[0,10]∪[170,180], S>60, V>60
+# 列方向の赤ピクセル密度が閾値超のx座標 → 80km/h・100km/hの候補
+# 2本の赤ライン検出 → 線形補間でスケール関数を構築
+# scale_fn(x_px) = km/h  (0pxが0km/h、検出した赤ラインを固定点として補間)
+```
+
+---
+
+### 課題2: 針跡（黒線）とノイズの分離精度向上
+
+**現状:** `extract_speed_trace`のViterbi法では印刷目盛り線と針跡が混在する場合がある  
+**目標:** `ring_base`（角度方向の中央値）除去をさらに強化し、針跡のS/N比を上げる
+
+**実装指針:**
+```python
+# 現在のコード（trace.py extract_speed_trace内）:
+ring_base = np.median(hp, axis=0, keepdims=True)  # 全角度での中央値
+hp2 = hp - ring_base
+
+# 改善案A: 中央値を「時間窓付き中央値」に変更（局所的な印刷パターンに対応）
+# 改善案B: polar.png上で色情報を活用
+#   - 黒インク: BGR ≈ (20,20,20)  ← 針跡
+#   - 緑印刷線: BGR ≈ (80,120,60) ← 目盛り
+#   - 赤印刷線: BGR ≈ (60,40,180)← 補助線
+#   各チャンネルの差分でインクタイプを分類するスコアを追加
+
+# 改善案C: continuity_weight と max_jump_px のチューニング
+#   現在: continuity_weight=2.0, max_jump_px=30.0
+#   推奨試験値: continuity_weight=3.5〜5.0, max_jump_px=15.0〜20.0
+#   （速度変化が急激な区間での飛び越しを抑制）
+```
+
+---
+
+### 課題3: 速度スケール半径の精度向上（r20/r120推定）
+
+**現状:** `estimate_speed_scale_radii`での推定が画像によって不安定  
+**目標:** 赤リング検出結果と組み合わせた確定的なスケール設定
+
+**実装指針:**
+```python
+# 推奨アプローチ: 「赤ライン検出（課題1）」と「半径推定」を統合
+# polar.png上でのキャリブレーション後、元の円形画像上の半径に逆変換
+
+# 現在の固定値パラメータ（cli_trace.py）:
+# --speed-scale-r20-ratio  0.840705
+# --speed-scale-r120-ratio 0.925113
+# → この値は検証済みサンプルから算出。新サンプルでの乖離を定量評価すること
+
+# 評価方法: 手動読み取り速度との MAE（平均絶対誤差）を計算
+# 目標精度: ±5km/h以内（時刻分解能1分あたり）
+```
+
+---
+
+### 課題4: 時刻アライメントの自動化
+
+**現状:** `estimate_zero_angle_deg`はスタブ実装（常に-90度を返す）  
+**目標:** チャート上の「12時マーク」または「切り欠き」から自動的にゼロ角度を推定
+
+**実装指針:**
+```python
+# detect_noon12_angle_debug（trace.py）は実装済みだが未テスト
+# テンプレートマッチングベースの12時検出：
+#   1. --time-ring-template-12-from-mark で最初の1枚からテンプレ生成
+#   2. 残りのサンプルに適用してスコア検証
+#   3. min_score=0.35 を調整（過検出/未検出のバランス）
+
+# 代替案: チャート下部の「切り欠き（スリット）」を暗領域として検出
+#   切り欠き = 角度プロファイルで突出した暗い領域 → その反対方向が12時
+```
+
+---
+
+## Microsoft Fabric 連携フェーズでの実装タスク
+
+Fabric Notebook（Python/Spark）上での次のステップ：
+
+### Step 1: 20サンプルの一括polar.png生成
+```bash
+python -m tachograph.cli_batch /path/to/samples/ \
+  --speed-r-in-frac 0.80 \
+  --speed-r-out-frac 0.95 \
+  --polar-theta-start-frac 0.5 \
+  --polar-theta-end-frac 1.0
+```
+
+### Step 2: 赤ライン自動キャリブレーション（上記課題1の実装後）
+```python
+# 各polar.pngに対して実行
+calibration = detect_red_calibration_lines(polar_bgr)
+# → {"x_80kmh": 340, "x_100kmh": 480, "scale_fn": <callable>}
+```
+
+### Step 3: 針跡のCSV化
+```python
+# 各行（時刻）ごとに速度を計算
+# 出力: (時刻_hhmm, 速度_kmh) のCSV
+```
+
+---
+
+## 開発環境セットアップ
+
+```bash
+# 依存ライブラリ
+pip install numpy>=1.26 opencv-python>=4.9 Pillow>=10.2 pillow-heif>=0.15 PyMuPDF>=1.23
+
+# 単体テスト実行（サンプル画像で動作確認）
+python -m tachograph.cli_batch sample.jpg --out-dir ./test_out/
+
+# デバッグ画像付き針検出
+python -m tachograph.cli_trace sample.jpg --debug --debug-image ./debug_out/trace.png
+```
+
+---
+
+## コーディング規約（既存スタイルに合わせること）
+
+- 全関数の戻り値に `@dataclass(frozen=True)` を使用
+- `debug: Dict[str, object]` を全ての推定関数が返すこと（可観測性の確保）
+- 浮動小数点は全て `float()` でキャスト（numpy型の混入を防ぐ）
+- 新規パラメータはすべて `argparse` のデフォルト値として外部化
+- 変更前に必ず `result.json` の `debug` セクションで処理結果を確認
+
+---
+
+## 優先実装順序
+
+1. **赤ライン自動キャリブレーション**（課題1）← 最優先。CSV化の前提条件
+2. **Viterbiパラメータチューニング**（課題2）← 20サンプルで定量評価
+3. **時刻アライメント自動化**（課題4）← 論文化にも必要
+4. **速度スケール半径の統合**（課題3）← 1と連動して実装
+
+---
+
+## 論文化・ビジネス化への注記
+
+- 各サンプルで**手動読み取りの正解データ**（ground truth）を記録しておくこと
+- 評価指標: MAE（km/h）、処理時間（秒/枚）、成功率（%）
+- 将来の特許・論文のために、アルゴリズムの変更履歴をGitコミットメッセージに詳細記録
