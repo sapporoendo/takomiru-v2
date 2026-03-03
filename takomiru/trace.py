@@ -653,6 +653,8 @@ def extract_speed_trace(
     radial_smooth_sigma: float = 1.2,
     baseline_smooth_sigma: float = 8.0,
     edge_boost: float = 0.4,
+    red_suppress_mask: Optional[np.ndarray] = None,
+    red_suppress_weight: float = 60.0,
 ) -> TraceResult:
     """MVP2: extract one radial trace point per angle.
 
@@ -705,8 +707,33 @@ def extract_speed_trace(
     ring_base = np.median(hp, axis=0, keepdims=True).astype(np.float32)
     hp2 = hp - ring_base
 
+    angle_base = np.median(hp2, axis=1, keepdims=True).astype(np.float32)
+    hp3 = hp2 - angle_base
+
     grad = np.gradient(ink_lp, axis=1).astype(np.float32)
-    score_by_angle = hp2 + float(edge_boost) * np.abs(grad)
+    score_by_angle = hp3 + float(edge_boost) * np.abs(grad)
+
+    if red_suppress_mask is not None:
+        red_rows: List[np.ndarray] = []
+        for a in angles_deg:
+            angle_deg = float(a)
+            theta = np.deg2rad(float(zero_angle_deg_val) + direction * angle_deg)
+            rs2 = radii_ref.astype(np.float32)
+            xs = float(center_xy[0]) + rs2 * np.cos(float(theta))
+            ys = float(center_xy[1]) + rs2 * np.sin(float(theta))
+            map_x = xs.reshape(-1, 1).astype(np.float32)
+            map_y = ys.reshape(-1, 1).astype(np.float32)
+            sampled = cv2.remap(
+                red_suppress_mask,
+                map_x,
+                map_y,
+                interpolation=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            ).reshape(-1).astype(np.float32) / 255.0
+            red_rows.append(sampled)
+        red_by_angle = np.stack(red_rows, axis=0)
+        score_by_angle = score_by_angle - float(red_suppress_weight) * red_by_angle
 
     method_l = method.strip().lower()
     if method_l not in {"viterbi", "greedy"}:
@@ -758,6 +785,8 @@ def extract_speed_trace(
         "radial_smooth_sigma": float(radial_smooth_sigma),
         "baseline_smooth_sigma": float(baseline_smooth_sigma),
         "edge_boost": float(edge_boost),
+        "red_suppress_applied": bool(red_suppress_mask is not None),
+        "red_suppress_weight": float(red_suppress_weight),
     }
 
     if zero_est is not None:

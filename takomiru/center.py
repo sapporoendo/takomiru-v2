@@ -8,6 +8,15 @@ import numpy as np
 
 
 @dataclass(frozen=True)
+class RedAuxRingsDetection:
+    center_x: float
+    center_y: float
+    r80: float
+    r100: float
+    debug: Dict[str, object]
+
+
+@dataclass(frozen=True)
 class CenterEstimation:
     center_x: float
     center_y: float
@@ -15,6 +24,296 @@ class CenterEstimation:
     inner_radius: Optional[float]
     center_uncertain: bool
     debug: Dict[str, object]
+
+
+def detect_center_from_red_aux_rings(bgr_u8: np.ndarray) -> Optional[RedAuxRingsDetection]:
+    if bgr_u8.ndim != 3 or bgr_u8.shape[2] != 3:
+        return None
+    if bgr_u8.dtype != np.uint8:
+        return None
+
+    h, w = bgr_u8.shape[:2]
+    min_dim = float(min(h, w))
+    if min_dim <= 10:
+        return None
+
+    # Detect on a downscaled image for Hough stability/speed.
+    scale = 1.0
+    target_min_dim = 1800.0
+    if min_dim > target_min_dim:
+        scale = float(target_min_dim / min_dim)
+    if scale < 1.0:
+        bgr_det = cv2.resize(
+            bgr_u8,
+            (int(round(float(w) * scale)), int(round(float(h) * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        bgr_det = bgr_u8
+
+    hd, wd = bgr_det.shape[:2]
+    min_dim_d = float(min(hd, wd))
+    if min_dim_d <= 10:
+        return None
+
+    hsv = cv2.cvtColor(bgr_det, cv2.COLOR_BGR2HSV)
+    # In smartphone photos, printed red can be less saturated/dim.
+    mask1 = cv2.inRange(hsv, (0, 35, 35), (10, 255, 255))
+    mask2 = cv2.inRange(hsv, (165, 35, 35), (180, 255, 255))
+    mask = cv2.bitwise_or(mask1, mask2)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+
+    m_blur = cv2.GaussianBlur(mask, (0, 0), 2.0)
+
+    min_r = int(round(0.20 * min_dim_d))
+    max_r = int(round(0.46 * min_dim_d))
+    if max_r <= min_r + 5:
+        return None
+
+    circles = cv2.HoughCircles(
+        m_blur,
+        cv2.HOUGH_GRADIENT,
+        dp=1.1,
+        minDist=0.06 * min_dim_d,
+        param1=120,
+        param2=15,
+        minRadius=int(min_r),
+        maxRadius=int(max_r),
+    )
+
+    raw = []
+    if circles is not None and circles.size:
+        for (x, y, r) in circles[0]:
+            raw.append((float(x), float(y), float(r)))
+
+    # Fallback: ring may be broken; use contours on the red mask.
+    cnt_raw = []
+    try:
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    except cv2.error:
+        cnts = []
+    if cnts:
+        for c in cnts:
+            area = float(cv2.contourArea(c))
+            if area < 250.0:
+                continue
+            (x0, y0), r0 = cv2.minEnclosingCircle(c)
+            rr = float(r0)
+            if not (float(min_r) <= rr <= float(max_r)):
+                continue
+            cnt_raw.append((float(x0), float(y0), float(rr)))
+
+    # Merge Hough + contour candidates (dedupe roughly).
+    merged = list(raw)
+    for (x, y, r) in cnt_raw:
+        ok = True
+        for (x2, y2, r2) in merged[:40]:
+            if float(np.hypot(x - x2, y - y2)) < 4.0 and abs(float(r - r2)) < 4.0:
+                ok = False
+                break
+        if ok:
+            merged.append((float(x), float(y), float(r)))
+
+    if len(merged) < 2:
+        return None
+
+    raw_sorted = sorted(merged, key=lambda t: float(t[2]), reverse=True)
+    best = None
+    best_score = -1e18
+    max_center_dist = 0.012 * min_dim
+    min_dr = 0.015 * min_dim
+
+    for i in range(min(len(raw_sorted), 12)):
+        x1, y1, r1 = raw_sorted[i]
+        for j in range(i + 1, min(len(raw_sorted), 24)):
+            x2, y2, r2 = raw_sorted[j]
+            dc = float(np.hypot(x1 - x2, y1 - y2))
+            if dc > max_center_dist:
+                continue
+            dr = float(abs(r1 - r2))
+            if dr < min_dr:
+                continue
+
+            r_big = float(max(r1, r2))
+            r_small = float(min(r1, r2))
+            ratio = r_small / max(1e-6, r_big)
+            score = (1.0 - min(1.0, dc / max(1e-6, max_center_dist))) + 0.6 * ratio
+            if score > best_score:
+                best_score = float(score)
+                best = (x1, y1, r1, x2, y2, r2, dc, dr)
+
+    if best is None:
+        return None
+
+    x1, y1, r1, x2, y2, r2, dc, dr = best
+    cx_d = 0.5 * (float(x1) + float(x2))
+    cy_d = 0.5 * (float(y1) + float(y2))
+    r_small = float(min(r1, r2))
+    r_big = float(max(r1, r2))
+
+    def _fit_circle_kasa(pts_xy: np.ndarray) -> Optional[Tuple[float, float, float]]:
+        if pts_xy.ndim != 2 or pts_xy.shape[1] != 2:
+            return None
+        if pts_xy.shape[0] < 60:
+            return None
+        x = pts_xy[:, 0].astype(np.float64)
+        y = pts_xy[:, 1].astype(np.float64)
+        A = np.column_stack([x, y, np.ones_like(x)])
+        b = x * x + y * y
+        try:
+            p, *_ = np.linalg.lstsq(A, b, rcond=None)
+        except Exception:
+            return None
+        a, bb, c = float(p[0]), float(p[1]), float(p[2])
+        cx0 = 0.5 * a
+        cy0 = 0.5 * bb
+        r0_sq = c + cx0 * cx0 + cy0 * cy0
+        if not np.isfinite(r0_sq) or r0_sq <= 1.0:
+            return None
+        r0 = float(np.sqrt(r0_sq))
+        return float(cx0), float(cy0), float(r0)
+
+    # Re-fit center using only upper arc points to reduce cutout bias.
+    upper_refit = {
+        "attempted": False,
+        "used": False,
+        "n_pts_total": 0,
+        "n_pts_upper": 0,
+        "n_pts_r80": 0,
+        "n_pts_r100": 0,
+    }
+    if cnts:
+        pts_all = []
+        for c in cnts:
+            if c is None or len(c) < 10:
+                continue
+            pts = c.reshape(-1, 2)
+            pts_all.append(pts)
+        if pts_all:
+            P = np.concatenate(pts_all, axis=0).astype(np.float32)
+            upper_refit["attempted"] = True
+            upper_refit["n_pts_total"] = int(P.shape[0])
+            P_up = P[P[:, 1] < float(cy_d) - 1.0]
+            upper_refit["n_pts_upper"] = int(P_up.shape[0])
+            if P_up.shape[0] >= 120:
+                dx = P_up[:, 0].astype(np.float32) - float(cx_d)
+                dy = P_up[:, 1].astype(np.float32) - float(cy_d)
+                rr = np.hypot(dx, dy)
+
+                tol = float(max(6.0, 0.010 * min_dim_d))
+                m80 = np.abs(rr - float(r_small)) <= tol
+                m100 = np.abs(rr - float(r_big)) <= tol
+                P80 = P_up[m80]
+                P100 = P_up[m100]
+                upper_refit["n_pts_r80"] = int(P80.shape[0])
+                upper_refit["n_pts_r100"] = int(P100.shape[0])
+
+                c80 = _fit_circle_kasa(P80) if P80.shape[0] >= 80 else None
+                c100 = _fit_circle_kasa(P100) if P100.shape[0] >= 80 else None
+
+                if (c80 is not None) and (c100 is not None):
+                    # Only correct the center from upper arc fits.
+                    # Radius will be re-estimated later using full 360deg points.
+                    cx_d = 0.5 * (float(c80[0]) + float(c100[0]))
+                    cy_d = 0.5 * (float(c80[1]) + float(c100[1]))
+                    upper_refit["used"] = True
+                    upper_refit["fit_r80"] = {"cx": float(c80[0]), "cy": float(c80[1]), "r": float(c80[2])}
+                    upper_refit["fit_r100"] = {"cx": float(c100[0]), "cy": float(c100[1]), "r": float(c100[2])}
+
+    # Re-estimate radii from all contour points using (possibly corrected) center.
+    radii_refit = {"attempted": False, "used": False}
+    if cnts:
+        pts_all = []
+        for c in cnts:
+            if c is None or len(c) < 10:
+                continue
+            pts_all.append(c.reshape(-1, 2))
+        if pts_all:
+            Pfull = np.concatenate(pts_all, axis=0).astype(np.float32)
+            radii_refit["attempted"] = True
+            dx = Pfull[:, 0].astype(np.float32) - float(cx_d)
+            dy = Pfull[:, 1].astype(np.float32) - float(cy_d)
+            rr = np.hypot(dx, dy)
+
+            # Keep plausible ring radii range.
+            rr = rr[(rr >= float(min_r)) & (rr <= float(max_r))]
+            radii_refit["n"] = int(rr.size)
+            if rr.size >= 400:
+                # Simple 1D two-cluster refinement (kmeans-like) on radii.
+                c1 = float(np.percentile(rr, 35.0))
+                c2 = float(np.percentile(rr, 75.0))
+                for _ in range(10):
+                    d1 = np.abs(rr - c1)
+                    d2 = np.abs(rr - c2)
+                    m1 = d1 <= d2
+                    m2 = ~m1
+                    if int(np.count_nonzero(m1)) < 50 or int(np.count_nonzero(m2)) < 50:
+                        break
+                    c1n = float(np.mean(rr[m1]))
+                    c2n = float(np.mean(rr[m2]))
+                    if abs(c1n - c1) < 0.01 and abs(c2n - c2) < 0.01:
+                        c1, c2 = c1n, c2n
+                        break
+                    c1, c2 = c1n, c2n
+
+                d1 = np.abs(rr - c1)
+                d2 = np.abs(rr - c2)
+                m1 = d1 <= d2
+                m2 = ~m1
+                if int(np.count_nonzero(m1)) >= 80 and int(np.count_nonzero(m2)) >= 80:
+                    rA = float(np.median(rr[m1]))
+                    rB = float(np.median(rr[m2]))
+                    r_small = float(min(rA, rB))
+                    r_big = float(max(rA, rB))
+                    radii_refit["used"] = True
+                    radii_refit["centers"] = {"c1": float(c1), "c2": float(c2)}
+                    radii_refit["counts"] = {"n1": int(np.count_nonzero(m1)), "n2": int(np.count_nonzero(m2))}
+                    radii_refit["r_median"] = {"r1": float(rA), "r2": float(rB)}
+
+    # Rescale back to original image coordinates.
+    inv = float(1.0 / max(1e-9, scale))
+    cx = float(cx_d) * inv
+    cy = float(cy_d) * inv
+    r_small = float(r_small) * inv
+    r_big = float(r_big) * inv
+
+    dbg: Dict[str, object] = {
+        "method": "red_aux_rings_hsv_hough",
+        "mask_nonzero": int(np.count_nonzero(mask)),
+        "hough": {
+            "dp": 1.2,
+            "minDist": float(0.06 * min_dim_d),
+            "param1": 120,
+            "param2": 15,
+            "minRadius": int(min_r),
+            "maxRadius": int(max_r),
+            "n": int(len(raw)),
+        },
+        "contours": {
+            "n": int(len(cnt_raw)),
+        },
+        "scale": float(scale),
+        "upper_arc_refit": dict(upper_refit),
+        "radii_refit": dict(radii_refit),
+        "pair": {
+            "c1": [float(x1), float(y1), float(r1)],
+            "c2": [float(x2), float(y2), float(r2)],
+            "center_dist": float(dc),
+            "radius_diff": float(dr),
+            "score": float(best_score),
+        },
+    }
+
+    return RedAuxRingsDetection(
+        center_x=float(cx),
+        center_y=float(cy),
+        r80=float(r_small),
+        r100=float(r_big),
+        debug=dbg,
+    )
 
 
 def _remove_border_touching_components(mask_u8: np.ndarray) -> np.ndarray:

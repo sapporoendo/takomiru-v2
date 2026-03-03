@@ -2,21 +2,37 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from .center import estimate_center_auto
+from .center import detect_center_from_red_aux_rings, estimate_center_auto
 from .io import load_image, rgb_to_gray_u8
-from .speed_scale import speed_scale_from_spindle_radius
-from .trace import (
-    detect_noon12_angle_debug,
-    extract_needle_mask,
-    extract_speed_trace,
-    estimate_speed_scale_radii,
-    fixed_speed_band_from_outer_radius,
-)
+try:
+    from .speed_scale import speed_scale_from_spindle_radius
+except ModuleNotFoundError:  # pragma: no cover
+    speed_scale_from_spindle_radius = None
+try:
+    from .trace import detect_noon12_angle_debug
+except ImportError:  # pragma: no cover
+    detect_noon12_angle_debug = None
+from .trace import extract_needle_mask, extract_speed_trace, estimate_speed_scale_radii, fixed_speed_band_from_outer_radius
+
+
+def make_red_suppress_mask(bgr_u8: np.ndarray) -> np.ndarray:
+    """HSVで赤補助線（80/100km/h）のマスクを生成する。"""
+    hsv = cv2.cvtColor(bgr_u8, cv2.COLOR_BGR2HSV)
+    # 赤は色相が0付近と180付近の2範囲
+    mask1 = cv2.inRange(hsv, (0, 80, 80), (10, 255, 255))
+    mask2 = cv2.inRange(hsv, (165, 80, 80), (180, 255, 255))
+    red_mask = cv2.bitwise_or(mask1, mask2)
+    # 少し膨張させて赤線の周辺も抑制
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    red_mask = cv2.dilate(red_mask, kernel, iterations=2)
+    return red_mask
 
 
 def _default_r_range(est) -> tuple[int, int]:
@@ -40,6 +56,9 @@ def main() -> int:
     parser.add_argument("input", help="Image/PDF path")
     parser.add_argument("--pdf-dpi", type=int, default=300)
     parser.add_argument("--pdf-page", type=int, default=0)
+
+    parser.add_argument("--center-x", type=float, default=None)
+    parser.add_argument("--center-y", type=float, default=None)
 
     parser.add_argument("--angle-step", type=float, default=1.0)
     parser.add_argument("--zero-angle-deg", type=float, default=-90.0, help="00:00 direction. Default is 12 o'clock")
@@ -99,6 +118,7 @@ def main() -> int:
 
     loaded = load_image(args.input, pdf_page_index=args.pdf_page, pdf_dpi=args.pdf_dpi)
     gray = rgb_to_gray_u8(loaded.rgb)
+    bgr_image = cv2.cvtColor(loaded.rgb, cv2.COLOR_RGB2BGR)
     time_gray = gray
     if bool(args.time_ring_use_green):
         rgb = loaded.rgb
@@ -112,18 +132,59 @@ def main() -> int:
         v = (v * 255.0).clip(0, 255).astype(np.uint8)
         time_gray = v
     est = estimate_center_auto(gray)
+    red_aux = None
+    if (args.center_x is not None) or (args.center_y is not None):
+        if args.center_x is None or args.center_y is None:
+            raise ValueError("--center-x and --center-y must be provided together")
+        dbg = dict(est.debug) if isinstance(est.debug, dict) else {}
+        dbg["manual_center"] = {"x": float(args.center_x), "y": float(args.center_y)}
+        est = replace(
+            est,
+            center_x=float(args.center_x),
+            center_y=float(args.center_y),
+            center_uncertain=False,
+            debug=dbg,
+        )
+    else:
+        red_aux = detect_center_from_red_aux_rings(bgr_image)
+        if red_aux is not None:
+            dbg = dict(est.debug) if isinstance(est.debug, dict) else {}
+            dbg["red_aux_rings"] = {
+                "center": {"x": float(red_aux.center_x), "y": float(red_aux.center_y)},
+                "r80": float(red_aux.r80),
+                "r100": float(red_aux.r100),
+                "debug": dict(red_aux.debug) if isinstance(red_aux.debug, dict) else {},
+            }
+            est = replace(
+                est,
+                center_x=float(red_aux.center_x),
+                center_y=float(red_aux.center_y),
+                center_uncertain=False,
+                debug=dbg,
+            )
 
     noon_det = None
     theta_noon_deg = None
     if args.manual_noon_angle_deg is not None:
         theta_noon_deg = float(args.manual_noon_angle_deg) % 360.0
     else:
+        if detect_noon12_angle_debug is None:
+            if args.time_ring_template_12_from_mark or args.time_ring_template_12:
+                raise ImportError("detect_noon12_angle_debug is unavailable in this workspace")
+            if bool(args.debug):
+                print(
+                    "warning: detect_noon12_angle_debug is unavailable; skipping auto noon detection",
+                    file=sys.stderr,
+                )
+        
         templ_bin = None
         if args.time_ring_template_12_from_mark:
             if est.outer_radius is None:
                 raise ValueError("--time-ring-template-12-from-mark requires a valid outer_radius")
 
             # First, compute polar band/bin without a template.
+            if detect_noon12_angle_debug is None:
+                raise ImportError("detect_noon12_angle_debug is unavailable in this workspace")
             noon_no_template = detect_noon12_angle_debug(
                 time_gray,
                 refine_gray_u8=gray,
@@ -230,7 +291,8 @@ def main() -> int:
             if templ is None:
                 raise ValueError(f"failed to read --time-ring-template-12: {tpath}")
             templ_bin = templ
-        if est.outer_radius is not None:
+
+        if (detect_noon12_angle_debug is not None) and (est.outer_radius is not None):
             noon_det = detect_noon12_angle_debug(
                 time_gray,
                 refine_gray_u8=gray,
@@ -270,6 +332,7 @@ def main() -> int:
     else:
         r_min, r_max = int(args.r_min), int(args.r_max)
 
+    red_mask = make_red_suppress_mask(bgr_image)
     trace = extract_speed_trace(
         gray,
         center_xy=(est.center_x, est.center_y),
@@ -278,6 +341,7 @@ def main() -> int:
         angle_step_deg=float(args.angle_step),
         zero_angle_deg=float(args.zero_angle_deg),
         clockwise=bool(args.clockwise),
+        red_suppress_mask=red_mask,
     )
 
     # Needle ROI (20–120km/h band) is a subset of the fixed speed-band annulus.
@@ -310,11 +374,21 @@ def main() -> int:
     if bool(args.auto_speed_scale):
         speed_scale_mode = "auto"
 
+    if not bool(args.use_fixed_speed_scale):
+        speed_scale_mode = "skip"
+
     if speed_scale_mode == "spindle":
+        if speed_scale_from_spindle_radius is None:
+            if bool(args.debug):
+                print(
+                    "warning: speed_scale module is missing; skipping spindle scale mode",
+                    file=sys.stderr,
+                )
+            speed_scale_mode = "skip"
         spindle_r = None
         if isinstance(est.debug, dict) and est.debug.get("spindle_detected"):
             spindle_r = est.debug.get("spindle_radius")
-        if spindle_r is not None:
+        if (speed_scale_mode == "spindle") and (spindle_r is not None):
             sc = speed_scale_from_spindle_radius(
                 float(spindle_r),
                 r20_mul=float(args.spindle_scale_r20_mul),
