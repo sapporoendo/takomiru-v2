@@ -26,7 +26,7 @@ def make_red_suppress_mask(bgr_u8: np.ndarray) -> np.ndarray:
     """HSVで赤補助線（80/100km/h）のマスクを生成する。"""
     hsv = cv2.cvtColor(bgr_u8, cv2.COLOR_BGR2HSV)
     # 赤は色相が0付近と180付近の2範囲
-    mask1 = cv2.inRange(hsv, (0, 80, 80), (10, 255, 255))
+    mask1 = cv2.inRange(hsv, (0, 60, 60), (35, 255, 255))
     mask2 = cv2.inRange(hsv, (165, 80, 80), (180, 255, 255))
     red_mask = cv2.bitwise_or(mask1, mask2)
     # 少し膨張させて赤線の周辺も抑制
@@ -60,12 +60,20 @@ def main() -> int:
     parser.add_argument("--center-x", type=float, default=None)
     parser.add_argument("--center-y", type=float, default=None)
 
+    parser.add_argument(
+        "--calibration-json",
+        type=str,
+        default=None,
+        help="calibration.jsonのパス。指定するとcenter-x/y/outer-radiusを自動注入する。",
+    )
+
     parser.add_argument("--angle-step", type=float, default=1.0)
     parser.add_argument("--zero-angle-deg", type=float, default=-90.0, help="00:00 direction. Default is 12 o'clock")
     parser.add_argument("--clockwise", action="store_true")
 
     parser.add_argument("--r-min", type=int, default=None)
     parser.add_argument("--r-max", type=int, default=None)
+    parser.add_argument("--outer-radius", type=float, default=None)
 
     parser.add_argument("--speed-band-r-in-ratio", type=float, default=0.55)
     parser.add_argument("--speed-band-r-out-ratio", type=float, default=0.86)
@@ -116,6 +124,23 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    if args.calibration_json is not None:
+        with open(args.calibration_json, "r") as f:
+            calib = json.load(f)
+        args.center_x = calib["center_x"]
+        args.center_y = calib["center_y"]
+        args.outer_radius = calib["outer_radius"]
+    else:
+        # ファイル名からキャリブレーション情報を自動抽出
+        # 例: tacho_cx540_cy960_r480.jpg
+        import re
+
+        m = re.search(r"cx(\d+)_cy(\d+)_r(\d+)", args.input)
+        if m and args.center_x is None:
+            args.center_x = int(m.group(1))
+            args.center_y = int(m.group(2))
+            args.outer_radius = int(m.group(3))
+
     loaded = load_image(args.input, pdf_page_index=args.pdf_page, pdf_dpi=args.pdf_dpi)
     gray = rgb_to_gray_u8(loaded.rgb)
     bgr_image = cv2.cvtColor(loaded.rgb, cv2.COLOR_RGB2BGR)
@@ -162,6 +187,9 @@ def main() -> int:
                 center_uncertain=False,
                 debug=dbg,
             )
+
+    if args.outer_radius is not None:
+        est = replace(est, outer_radius=float(args.outer_radius))
 
     noon_det = None
     theta_noon_deg = None
