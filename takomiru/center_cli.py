@@ -21,7 +21,8 @@ def main() -> int:
 
     loaded = load_image(args.input, pdf_page_index=args.pdf_page, pdf_dpi=args.pdf_dpi)
     gray = rgb_to_gray_u8(loaded.rgb)
-    est = estimate_center_auto(gray)
+    bgr = cv2.cvtColor(loaded.rgb, cv2.COLOR_RGB2BGR)
+    est = estimate_center_auto(gray, bgr_u8=bgr)
 
     out = {
         "source": str(Path(loaded.source_path)),
@@ -38,8 +39,6 @@ def main() -> int:
             else Path(loaded.source_path).with_name(Path(loaded.source_path).stem + "_center_debug.png")
         )
 
-        bgr = cv2.cvtColor(loaded.rgb, cv2.COLOR_RGB2BGR)
-
         cx = int(round(est.center_x))
         cy = int(round(est.center_y))
         cv2.drawMarker(bgr, (cx, cy), (0, 255, 255), markerType=cv2.MARKER_CROSS, markerSize=40, thickness=3)
@@ -47,10 +46,8 @@ def main() -> int:
         outer_center = est.debug.get("outer_center") if isinstance(est.debug, dict) else None
         inner_center = est.debug.get("inner_center") if isinstance(est.debug, dict) else None
 
-        if outer_center is not None and est.outer_radius is not None:
-            ox, oy = int(round(float(outer_center[0]))), int(round(float(outer_center[1])))
-            cv2.circle(bgr, (ox, oy), int(round(float(est.outer_radius))), (255, 0, 0), 3)
-            cv2.circle(bgr, (ox, oy), 6, (255, 0, 0), -1)
+        if est.outer_radius is not None:
+            cv2.circle(bgr, (cx, cy), int(round(float(est.outer_radius))), (255, 0, 0), 3)
 
         if inner_center is not None and est.inner_radius is not None:
             ix, iy = int(round(float(inner_center[0]))), int(round(float(inner_center[1])))

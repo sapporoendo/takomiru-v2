@@ -704,7 +704,7 @@ def extract_speed_trace(
     hp = ink_lp - ink_base
 
     # Suppress printed concentric rings by subtracting per-radius median across angles.
-    ring_base = np.median(hp, axis=0, keepdims=True).astype(np.float32)
+    ring_base = np.percentile(hp, 25, axis=0, keepdims=True).astype(np.float32)
     hp2 = hp - ring_base
 
     angle_base = np.median(hp2, axis=1, keepdims=True).astype(np.float32)

@@ -58,11 +58,11 @@ def detect_center_from_red_aux_rings(bgr_u8: np.ndarray) -> Optional[RedAuxRings
 
     hsv = cv2.cvtColor(bgr_det, cv2.COLOR_BGR2HSV)
     # In smartphone photos, printed red can be less saturated/dim.
-    mask1 = cv2.inRange(hsv, (0, 35, 35), (10, 255, 255))
+    mask1 = cv2.inRange(hsv, (0, 30, 30), (35, 255, 255))
     mask2 = cv2.inRange(hsv, (165, 35, 35), (180, 255, 255))
     mask = cv2.bitwise_or(mask1, mask2)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.dilate(mask, kernel, iterations=1)
 
@@ -123,12 +123,12 @@ def detect_center_from_red_aux_rings(bgr_u8: np.ndarray) -> Optional[RedAuxRings
     raw_sorted = sorted(merged, key=lambda t: float(t[2]), reverse=True)
     best = None
     best_score = -1e18
-    max_center_dist = 0.012 * min_dim
-    min_dr = 0.015 * min_dim
+    max_center_dist = 0.05 * min_dim
+    min_dr = 0.015 * min_dim_d
 
-    for i in range(min(len(raw_sorted), 12)):
+    for i in range(min(len(raw_sorted), 60)):
         x1, y1, r1 = raw_sorted[i]
-        for j in range(i + 1, min(len(raw_sorted), 24)):
+        for j in range(i + 1, min(len(raw_sorted), 80)):
             x2, y2, r2 = raw_sorted[j]
             dc = float(np.hypot(x1 - x2, y1 - y2))
             if dc > max_center_dist:
@@ -650,7 +650,7 @@ def _pick_best_inner_circle(gray_u8: np.ndarray, circles: np.ndarray) -> Tuple[f
 def _largest_dark_blob_center(gray_u8: np.ndarray) -> Optional[Tuple[float, float, float]]:
     blur = cv2.GaussianBlur(gray_u8, (0, 0), 2.0)
     _, mask = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
@@ -781,7 +781,7 @@ def _spindle_hole_center(gray_u8: np.ndarray, *, min_r: int, max_r: int) -> Opti
     _, m1 = cv2.threshold(blur, max(0.0, min(255.0, t)), 255, cv2.THRESH_BINARY_INV)
     masks.append(m1)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
     best = None
     best_score = -1e18
@@ -980,7 +980,14 @@ def estimate_center(gray_u8: np.ndarray) -> CenterEstimation:
     debug["center_pick_outer_score"] = float(outer_score)
     debug["center_pick_inner_score"] = float(inner_score)
 
-    if outer_score >= inner_score:
+    spindle_ok = bool(debug.get("spindle_detected")) and debug.get("inner_source") == "spindle"
+    outer_radial_ok = bool(debug.get("outer_radial_ok"))
+
+    if spindle_ok and not outer_radial_ok:
+        cx = float(ix)
+        cy = float(iy)
+        debug["center_pick"] = "inner_spindle_priority"
+    elif outer_score >= inner_score:
         cx = float(ox)
         cy = float(oy)
         debug["center_pick"] = "outer"
@@ -989,21 +996,190 @@ def estimate_center(gray_u8: np.ndarray) -> CenterEstimation:
         cy = float(iy)
         debug["center_pick"] = "inner"
 
-    uncertain = dist > 12.0
+    if debug["center_pick"] == "inner_spindle_priority" and inner_radial is not None:
+        best_outer_r = float(inner_radial[0])
+    elif outer is not None:
+        best_outer_r = float(outer[2])
+    else:
+        best_outer_r = None
 
+    uncertain = dist > 12.0
     return CenterEstimation(
         center_x=cx,
         center_y=cy,
-        outer_radius=outer[2] if outer is not None else None,
+        outer_radius=best_outer_r,
         inner_radius=inner[2] if inner is not None else None,
         center_uncertain=uncertain,
         debug=debug,
     )
 
 
-def estimate_center_auto(gray_u8: np.ndarray) -> CenterEstimation:
+def detect_red_rings_radial(
+    bgr_u8: np.ndarray,
+    *,
+    center_xy: Tuple[float, float],
+    min_r: int,
+    max_r: int,
+    n_angles: int = 120,
+) -> Optional[Dict[str, float]]:
+    """中心から放射状スキャンし、赤い補助線（80/100km/h）の半径を検出する。
+    検出成功時は r80, r100, r20, r120, outer_radius を返す。"""
+    h, w = bgr_u8.shape[:2]
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+    if bgr_u8.ndim != 3 or bgr_u8.shape[2] != 3:
+        return None
+    if not (0 <= cx < w and 0 <= cy < h):
+        return None
+    if max_r <= min_r + 5:
+        return None
+
+    hsv = cv2.cvtColor(bgr_u8, cv2.COLOR_BGR2HSV)
+    red_mask = (
+        cv2.inRange(hsv, np.array([0, 60, 60]), np.array([10, 255, 255]))
+        | cv2.inRange(hsv, np.array([170, 60, 60]), np.array([180, 255, 255]))
+    ).astype(np.float32) / 255.0
+
+    angles_deg = np.linspace(0, 360, n_angles, endpoint=False)
+    angles_deg = angles_deg[(angles_deg < 150) | (angles_deg > 210)]
+
+    rs = np.arange(int(min_r), int(max_r) + 1, dtype=np.float32)
+    all_profiles = []
+
+    for deg in angles_deg:
+        rad = np.deg2rad(deg)
+        xs = cx + np.cos(rad) * rs
+        ys = cy + np.sin(rad) * rs
+        xi = np.rint(xs).astype(np.int32)
+        yi = np.rint(ys).astype(np.int32)
+        ok = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+        profile = np.zeros(len(rs), dtype=np.float32)
+        profile[ok] = red_mask[yi[ok], xi[ok]]
+        all_profiles.append(profile)
+
+    if not all_profiles:
+        return None
+
+    median_profile = np.mean(np.array(all_profiles), axis=0)
+
+    sigma = max(1, int(max_r - min_r) // 80)
+    ksize = int(max(3, sigma * 6 + 1))
+    if (ksize % 2) == 0:
+        ksize += 1
+    smoothed = cv2.GaussianBlur(median_profile.reshape(1, -1), (ksize, 1), sigmaX=float(sigma)).reshape(-1)
+
+    min_distance = max(1, int((max_r - min_r) * 0.05))
+    peaks = []
+    for i in range(1, len(smoothed) - 1):
+        if smoothed[i] < 0.05:
+            continue
+        if smoothed[i] >= smoothed[i - 1] and smoothed[i] >= smoothed[i + 1]:
+            if peaks and (i - peaks[-1]) < min_distance:
+                if smoothed[i] > smoothed[peaks[-1]]:
+                    peaks[-1] = i
+            else:
+                peaks.append(i)
+
+    if len(peaks) < 2:
+        return None
+
+    heights = smoothed[np.array(peaks, dtype=np.int32)]
+    top2_idx = np.argsort(heights)[-2:]
+    top2_peaks = np.sort(np.array(peaks, dtype=np.int32)[top2_idx])
+
+    r_inner_peak = float(rs[int(top2_peaks[0])])
+    r_outer_peak = float(rs[int(top2_peaks[1])])
+
+    dr = r_outer_peak - r_inner_peak
+    if dr < 10:
+        return None
+
+    r20 = r_inner_peak - 3.0 * dr
+    r120 = r_inner_peak + 2.0 * dr
+    outer_radius = r120 / 0.95
+
+    return {
+        "r80": float(r_inner_peak),
+        "r100": float(r_outer_peak),
+        "r20": float(r20),
+        "r120": float(r120),
+        "outer_radius": float(outer_radius),
+    }
+
+
+def estimate_center_auto(gray_u8: np.ndarray, bgr_u8: Optional[np.ndarray] = None) -> CenterEstimation:
     h, w = gray_u8.shape[:2]
     min_dim = min(h, w)
+
+    # PWA撮影画像は中心が画像中央付近に来る前提で探索範囲を絞る
+    cx_hint = w / 2.0
+    cy_hint = h / 2.0
+    margin = min_dim * 0.15
+    x0c = int(max(0, cx_hint - margin))
+    y0c = int(max(0, cy_hint - margin))
+    x1c = int(min(w, cx_hint + margin))
+    y1c = int(min(h, cy_hint + margin))
+    crop = gray_u8[y0c:y1c, x0c:x1c]
+    spindle_crop = _spindle_hole_center(crop, min_r=int(min_dim * 0.02), max_r=int(min_dim * 0.065))
+    if spindle_crop is not None:
+        spindle = (float(spindle_crop[0]) + x0c, float(spindle_crop[1]) + y0c, float(spindle_crop[2]))
+    else:
+        spindle = None
+
+    # スピンドルが見つかった場合、そこを中心にROIを作って解析
+    if spindle is not None:
+        cx, cy = float(spindle[0]), float(spindle[1])
+        outer_max_r = int(min_dim * 0.60)
+        half = float(outer_max_r) * 1.15
+        rx0 = int(max(0, np.floor(cx - half)))
+        ry0 = int(max(0, np.floor(cy - half)))
+        rx1 = int(min(w, np.ceil(cx + half)))
+        ry1 = int(min(h, np.ceil(cy + half)))
+        if (rx1 - rx0) >= 10 and (ry1 - ry0) >= 10:
+            roi = gray_u8[ry0:ry1, rx0:rx1]
+            est_roi = estimate_center(roi)
+            debug = dict(est_roi.debug) if isinstance(est_roi.debug, dict) else {}
+            debug.update({
+                "roi_used": True,
+                "roi_method": "spindle_center_crop",
+                "roi_offset": [int(rx0), int(ry0)],
+                "roi_shape": [int(roi.shape[0]), int(roi.shape[1])],
+                "spindle_hint": [float(cx), float(cy)],
+            })
+            final_cx = float(est_roi.center_x) + float(rx0)
+            final_cy = float(est_roi.center_y) + float(ry0)
+            red_result = None
+            if bgr_u8 is not None:
+                red_result = detect_red_rings_radial(
+                    bgr_u8,
+                    center_xy=(final_cx, final_cy),
+                    min_r=int(min_dim * 0.20),
+                    max_r=int(min_dim * 0.55),
+                )
+            if red_result is not None:
+                best_outer_r = float(red_result["outer_radius"])
+                debug["red_rings"] = red_result
+            else:
+                outer_r_direct = _radial_outer_radius(
+                    gray_u8,
+                    center_xy=(final_cx, final_cy),
+                    min_r=int(min_dim * 0.30),
+                    max_r=int(min_dim * 0.60),
+                )
+                radial_min_r = int(min_dim * 0.30)
+                if outer_r_direct is not None and float(outer_r_direct[0]) > radial_min_r * 1.05:
+                    best_outer_r = float(outer_r_direct[0])
+                else:
+                    best_outer_r = float(min_dim) * 0.44
+
+            debug["outer_radius_direct"] = float(best_outer_r)
+            return CenterEstimation(
+                center_x=final_cx,
+                center_y=final_cy,
+                outer_radius=best_outer_r,
+                inner_radius=est_roi.inner_radius,
+                center_uncertain=False,
+                debug=debug,
+            )
 
     disc = _disc_circle_contour(gray_u8)
     if disc is not None:
@@ -1057,16 +1233,26 @@ def estimate_center_auto(gray_u8: np.ndarray) -> CenterEstimation:
 
     roi_method = None
     roi_res = None
-    # Prefer disc contour ROI; spindle detection can be a false positive on some scans and
-    # can cause ROI to be cut far away from the actual disc.
-    roi_res = _disc_roi(gray_u8)
-    roi_method = "contour" if roi_res is not None else roi_method
+    if spindle is not None:
+        cx, cy = float(spindle[0]), float(spindle[1])
+        if (0.15 * w) <= cx <= (0.85 * w) and (0.15 * h) <= cy <= (0.85 * h):
+            outer_max_r = int(min_dim * 0.60)
+            half = float(outer_max_r) * 1.15
+            x0 = int(max(0, np.floor(cx - half)))
+            y0 = int(max(0, np.floor(cy - half)))
+            x1 = int(min(w, np.ceil(cx + half)))
+            y1 = int(min(h, np.ceil(cy + half)))
+            if (x1 - x0) >= 10 and (y1 - y0) >= 10:
+                roi_res = (gray_u8[y0:y1, x0:x1], (x0, y0))
+                roi_method = "spindle_first"
+    if roi_res is None:
+        roi_res = _disc_roi(gray_u8)
+        roi_method = "contour" if roi_res is not None else roi_method
     if roi_res is None:
         roi_res = _disc_roi_hough(gray_u8)
         roi_method = "hough" if roi_res is not None else roi_method
     if roi_res is None and spindle is not None:
         cx, cy = float(spindle[0]), float(spindle[1])
-        # Sanity-check spindle position; ignore if too close to borders.
         if (0.15 * w) <= cx <= (0.85 * w) and (0.15 * h) <= cy <= (0.85 * h):
             outer_max_r = int(min_dim * 0.60)
             half = float(outer_max_r) * 1.15
