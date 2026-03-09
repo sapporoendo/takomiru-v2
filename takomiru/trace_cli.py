@@ -172,6 +172,14 @@ def main() -> int:
         )
     else:
         red_aux = detect_center_from_red_aux_rings(bgr_image)
+        h_img, w_img = gray.shape[:2]
+        red_aux_center_valid = (
+            red_aux is not None
+            and float(red_aux.center_x) > float(w_img) * 0.05
+            and float(red_aux.center_x) < float(w_img) * 0.95
+            and float(red_aux.center_y) > float(h_img) * 0.05
+            and float(red_aux.center_y) < float(h_img) * 0.95
+        )
         if red_aux is not None:
             dbg = dict(est.debug) if isinstance(est.debug, dict) else {}
             dbg["red_aux_rings"] = {
@@ -180,13 +188,16 @@ def main() -> int:
                 "r100": float(red_aux.r100),
                 "debug": dict(red_aux.debug) if isinstance(red_aux.debug, dict) else {},
             }
-            est = replace(
-                est,
-                center_x=float(red_aux.center_x),
-                center_y=float(red_aux.center_y),
-                center_uncertain=False,
-                debug=dbg,
-            )
+            if red_aux_center_valid:
+                est = replace(
+                    est,
+                    center_x=float(red_aux.center_x),
+                    center_y=float(red_aux.center_y),
+                    center_uncertain=False,
+                    debug=dbg,
+                )
+            else:
+                est = replace(est, debug=dbg)
 
     if args.outer_radius is not None:
         est = replace(est, outer_radius=float(args.outer_radius))
