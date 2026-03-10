@@ -1307,3 +1307,41 @@ def estimate_center_auto(gray_u8: np.ndarray, bgr_u8: Optional[np.ndarray] = Non
         center_uncertain=est_roi.center_uncertain,
         debug=debug,
     )
+
+
+def refine_center_from_known_radii(
+    bgr_u8: np.ndarray,
+    *,
+    hint_center_xy: Tuple[float, float],
+    r80: float,
+    r100: float,
+    search_margin: int = 25,
+) -> Tuple[float, float]:
+    """r80/r100の既知半径を使ってHough円検出で中心を精密補正する。"""
+    h, w = bgr_u8.shape[:2]
+    gray = cv2.cvtColor(bgr_u8, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (0, 0), 2.0)
+
+    centers = []
+    for r_target in [r80, r100]:
+        r_min = max(10, int(r_target) - search_margin)
+        r_max = int(r_target) + search_margin
+        circles = cv2.HoughCircles(
+            blur,
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=float(min(h, w)) * 0.3,
+            param1=80,
+            param2=20,
+            minRadius=r_min,
+            maxRadius=r_max,
+        )
+        if circles is not None and circles.size > 0:
+            best = min(circles[0], key=lambda c: (c[0] - hint_center_xy[0])**2 + (c[1] - hint_center_xy[1])**2)
+            centers.append((float(best[0]), float(best[1])))
+
+    if len(centers) == 0:
+        return hint_center_xy
+    cx = float(np.mean([c[0] for c in centers]))
+    cy = float(np.mean([c[1] for c in centers]))
+    return cx, cy

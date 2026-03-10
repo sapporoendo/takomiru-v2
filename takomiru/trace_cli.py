@@ -9,7 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .center import detect_center_from_red_aux_rings, estimate_center_auto
+from .center import detect_center_from_red_aux_rings, estimate_center_auto, refine_center_from_known_radii
 from .io import load_image, rgb_to_gray_u8
 try:
     from .speed_scale import speed_scale_from_spindle_radius
@@ -158,6 +158,8 @@ def main() -> int:
         time_gray = v
     est = estimate_center_auto(gray)
     red_aux = None
+
+    # ① PWA値を粗い初期中心としてセット
     if (args.center_x is not None) or (args.center_y is not None):
         if args.center_x is None or args.center_y is None:
             raise ValueError("--center-x and --center-y must be provided together")
@@ -170,34 +172,41 @@ def main() -> int:
             center_uncertain=False,
             debug=dbg,
         )
-    else:
-        red_aux = detect_center_from_red_aux_rings(bgr_image)
-        h_img, w_img = gray.shape[:2]
-        red_aux_center_valid = (
-            red_aux is not None
-            and float(red_aux.center_x) > float(w_img) * 0.05
-            and float(red_aux.center_x) < float(w_img) * 0.95
-            and float(red_aux.center_y) > float(h_img) * 0.05
-            and float(red_aux.center_y) < float(h_img) * 0.95
+
+    # ② 赤補助線で精密補正（放射状スキャン方式）
+    h_img, w_img = gray.shape[:2]
+    red_aux = None
+    from .center import detect_red_rings_radial
+    min_dim = int(min(h_img, w_img))
+    red_radial = detect_red_rings_radial(
+        bgr_image,
+        center_xy=(float(est.center_x), float(est.center_y)),
+        min_r=int(min_dim * 0.20),
+        max_r=int(min_dim * 0.55),
+    )
+    if red_radial is not None:
+        dbg = dict(est.debug) if isinstance(est.debug, dict) else {}
+        dbg["red_rings_radial"] = red_radial
+        est = replace(
+            est,
+            outer_radius=float(red_radial["outer_radius"]),
+            debug=dbg,
         )
-        if red_aux is not None:
-            dbg = dict(est.debug) if isinstance(est.debug, dict) else {}
-            dbg["red_aux_rings"] = {
-                "center": {"x": float(red_aux.center_x), "y": float(red_aux.center_y)},
-                "r80": float(red_aux.r80),
-                "r100": float(red_aux.r100),
-                "debug": dict(red_aux.debug) if isinstance(red_aux.debug, dict) else {},
-            }
-            if red_aux_center_valid:
-                est = replace(
-                    est,
-                    center_x=float(red_aux.center_x),
-                    center_y=float(red_aux.center_y),
-                    center_uncertain=False,
-                    debug=dbg,
-                )
-            else:
-                est = replace(est, debug=dbg)
+        if args.r_min is None:
+            args.r_min = int(round(float(red_radial["r20"])))
+        if args.r_max is None:
+            args.r_max = int(round(float(red_radial["r120"])))
+        print(f"[red_rings] r80={red_radial['r80']:.0f} r100={red_radial['r100']:.0f} r20={red_radial['r20']:.0f} r120={red_radial['r120']:.0f}", file=sys.stderr)
+        refined_cx, refined_cy = refine_center_from_known_radii(
+            bgr_image,
+            hint_center_xy=(float(est.center_x), float(est.center_y)),
+            r80=float(red_radial["r80"]),
+            r100=float(red_radial["r100"]),
+        )
+        print(f"[refine_center] {est.center_x:.0f},{est.center_y:.0f} → {refined_cx:.0f},{refined_cy:.0f}", file=sys.stderr)
+        est = replace(est, center_x=refined_cx, center_y=refined_cy, center_uncertain=False)
+
+    red_aux_center_valid = False
 
     if args.outer_radius is not None:
         est = replace(est, outer_radius=float(args.outer_radius))
